@@ -1,0 +1,14 @@
+[Unit]
+Description=BookStack MCP Server
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/bookstack-mcp.env
+ExecStart=/usr/bin/node /opt/bookstack-mcp/dist/index.js
+WorkingDirectory=/opt/bookstack-mcp
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
