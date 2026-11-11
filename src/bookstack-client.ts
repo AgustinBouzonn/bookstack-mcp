@@ -1,11 +1,54 @@
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, AxiosAdapter } from 'axios';
+import https from 'https';
+import { Semaphore } from './util/semaphore.js';
+import { countWords } from './util/word-count.js';
+import { rateLimitedAdapter } from './util/rate-limit.js';
+import { MAX_IMAGE_BYTES, readImageSource } from './image-source.js';
+import { PublicError, logSafeError, safeError } from './util/safe-errors.js';
+
+// BookStack resolves {created_by:X}/{updated_by:X}/{owned_by:X} by user SLUG, with 'me'
+// as a shortcut for the token's own user, and silently SKIPS the filter when X matches no
+// user's slug — the query falls back to unfiltered results, which is a confusing footgun
+// (SearchRunner::filterCreatedBy et al. look users up by slug only). A numeric user ID is
+// the classic way to hit it, so reject that form up front and point the caller at
+// find_users for the slug.
+function validateUserIdFilters(query: string): void {
+  const re = /\{(!?)(created_by|updated_by|owned_by):([^}\s]+)\}/g;
+  for (const match of query.matchAll(re)) {
+    const [, neg, field, value] = match;
+    if (/^\d+$/.test(value)) {
+      throw new PublicError(
+        `Search filter {${neg}${field}:${value}} takes a user slug or 'me', not a numeric user ID — ` +
+        `BookStack resolves these filters by slug and silently returns unfiltered results for ` +
+        `unmatched values. Use the find_users tool to look up a user's slug by name or email.`
+      );
+    }
+  }
+}
 
 export interface BookStackConfig {
   baseUrl: string;
   tokenId: string;
   tokenSecret: string;
   enableWrite?: boolean;
+  insecureSkipTlsVerify?: boolean;
+  /** Per-request HTTP timeout in ms. Bounds a slow/hung BookStack response so a
+   *  call fails cleanly instead of hanging until the MCP client gives up. */
+  timeoutMs?: number;
+  /** Total budget per API request, including queueing and 429 retries. Default 60s. */
+  retryTimeoutMs?: number;
+  /** Isolate permission-dependent slug lookups for request-supplied identities. */
+  privateSlugCache?: boolean;
+  allowLocalImageFiles?: boolean;
+  imageAllowedHosts?: string[];
+  /** Max concurrent in-flight HTTP requests to BookStack, process-wide per base
+   *  URL. Bounds concurrent requests to smooth out parallel bursts (the pattern
+   *  that triggers 429 storms). This complements, does not replace, the 429
+   *  backoff/retry; it does not itself cap the request rate. Default 4. */
+  maxConcurrency?: number;
 }
+
+const DEFAULT_TIMEOUT_MS = 30000;
 
 export interface Book {
   id: number;
@@ -24,12 +67,16 @@ export interface Page {
   name: string;
   slug: string;
   html: string;
+  /** Stored editor HTML, before BookStack's render step (includes, content filtering). */
+  raw_html?: string;
   markdown: string;
   text: string;
   created_at: string;
   updated_at: string;
   owned_by: number;
 }
+
+export type PageContentFormat = 'markdown' | 'html' | 'text' | 'raw';
 
 export interface Chapter {
   id: number;
@@ -76,6 +123,20 @@ export interface Attachment {
   };
 }
 
+export interface User {
+  id: number;
+  name: string;
+  slug: string;
+  email?: string;
+  external_auth_id?: string;
+  created_at?: string;
+  updated_at?: string;
+  last_activity_at?: string;
+  profile_url?: string;
+  edit_url?: string;
+  avatar_url?: string;
+}
+
 export interface SearchResult {
   type: string;
   id: number;
@@ -96,39 +157,180 @@ export interface ListResponse<T> {
   total: number;
 }
 
+// How long a completed bulk warm stays fresh before the next lookup re-sweeps
+// `/books` (books get created/renamed). Gaps within the window are handled by
+// the lazy per-id fetch in getBookSlug.
+const SLUG_CACHE_TTL_MS = 10 * 60 * 1000;
+
+interface SlugCacheEntry {
+  cache: Map<number, string>;
+  // In-flight single-book lookups, keyed by id, so concurrent callers for the
+  // same book share one request instead of stampeding BookStack.
+  inflight: Map<number, Promise<string>>;
+  // The in-progress bulk warm (present only while one is running), so concurrent
+  // callers await one warm instead of each sweeping /books.
+  warm?: Promise<void>;
+  // When the last warm completed (ms); undefined until the first warm finishes.
+  warmedAt?: number;
+}
+
+// Process-wide slug caches keyed by BookStack base URL. The book-id -> slug
+// mapping is identical for every caller of the same BookStack instance
+// regardless of which API token is used, so sharing it across the per-session
+// BookStackClient instances (index.ts builds one per MCP session) turns a
+// per-session bulk warm into one warm per process per TTL — far fewer /books
+// calls against the single, rate-limited (180/min) shared service token.
+const slugCaches: Map<string, SlugCacheEntry> = new Map();
+
+function getSlugCacheEntry(baseUrl: string): SlugCacheEntry {
+  let entry = slugCaches.get(baseUrl);
+  if (!entry) {
+    entry = { cache: new Map(), inflight: new Map() };
+    slugCaches.set(baseUrl, entry);
+  }
+  return entry;
+}
+
+const DEFAULT_MAX_CONCURRENCY = 4;
+
+// Process-wide concurrency limiters, one per BookStack base URL — shared across
+// all sessions/clients so they cannot collectively exceed the per-token rate
+// limit. Mirrors the slugCaches sharing model.
+const concurrencyLimiters: Map<string, Semaphore> = new Map();
+
+function getConcurrencyLimiter(baseUrl: string, max: number): Semaphore {
+  let limiter = concurrencyLimiters.get(baseUrl);
+  if (!limiter) {
+    limiter = new Semaphore(max);
+    concurrencyLimiters.set(baseUrl, limiter);
+  }
+  return limiter;
+}
+
 export class BookStackClient {
   private client: AxiosInstance;
   private enableWrite: boolean;
   private baseUrl: string;
-  private bookSlugCache: Map<number, string> = new Map();
+  private slugCache: SlugCacheEntry;
+  private imageSourcePolicy: Pick<BookStackConfig, 'allowLocalImageFiles' | 'imageAllowedHosts'>;
 
   constructor(config: BookStackConfig) {
     this.enableWrite = config.enableWrite || false;
     this.baseUrl = config.baseUrl;
+    this.imageSourcePolicy = config;
+    this.slugCache = config.privateSlugCache
+      ? { cache: new Map(), inflight: new Map() }
+      : getSlugCacheEntry(config.baseUrl);
+    const limiter = getConcurrencyLimiter(
+      config.baseUrl,
+      config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY
+    );
+    const baseAdapter: AxiosAdapter = axios.getAdapter(axios.defaults.adapter);
+
     this.client = axios.create({
       baseURL: `${config.baseUrl}/api`,
+      timeout: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       headers: {
         'Authorization': `Token ${config.tokenId}:${config.tokenSecret}`,
         'Content-Type': 'application/json'
-      }
+      },
+      httpsAgent: config.insecureSkipTlsVerify
+        ? new https.Agent({ rejectUnauthorized: false })
+        : undefined,
+      adapter: rateLimitedAdapter(baseAdapter, limiter, config.retryTimeoutMs ?? 60000),
+    });
+    // Do not let SDK error conversion or callers expose Axios config/bodies.
+    this.client.interceptors.response.use(undefined, error => {
+      throw safeError(error, 'BookStack request failed');
     });
   }
 
-  private async getBookSlug(bookId: number): Promise<string> {
-    // Check cache first
-    if (this.bookSlugCache.has(bookId)) {
-      return this.bookSlugCache.get(bookId)!;
+  private applyFilters(params: Record<string, any>, filter?: Record<string, any>): void {
+    if (!filter) return;
+    for (const [key, value] of Object.entries(filter)) {
+      if (value === undefined || value === null) continue;
+      params[`filter[${key}]`] = value;
     }
+  }
 
-    try {
-      const response = await this.client.get(`/books/${bookId}`);
-      const slug = response.data.slug || String(bookId);
-      this.bookSlugCache.set(bookId, slug);
-      return slug;
-    } catch (error) {
-      // Fallback to ID if book fetch fails
-      return String(bookId);
+  /**
+   * Populate the process-wide book-slug cache from a single bulk `/books`
+   * listing. Enhancing a result set resolves a slug per item; without a warm
+   * cache a search whose results span (or even share) many books fires a
+   * concurrent `GET /books/{id}` per item — a cache stampede that BookStack
+   * rate-limits (429), and the retrying requests pile up in memory until the
+   * process OOMs. The warm is shared across all client instances for this base
+   * URL (see slugCaches) and re-runs at most once per SLUG_CACHE_TTL_MS, so
+   * many MCP sessions cost one sweep, not one each. Concurrent callers await the
+   * single in-flight warm. Failure is non-fatal: getBookSlug lazily fills gaps.
+   */
+  private async warmBookSlugCache(): Promise<void> {
+    const entry = this.slugCache;
+
+    // A completed warm is still fresh → nothing to do (lazy fetch covers gaps).
+    if (entry.warmedAt !== undefined && Date.now() - entry.warmedAt < SLUG_CACHE_TTL_MS) {
+      return;
     }
+    // A warm is already running → join it instead of starting another sweep.
+    if (entry.warm) return entry.warm;
+
+    entry.warm = (async () => {
+      const pageSize = 500;
+      const maxPages = 20; // safety cap (10k books) — huge wikis fall back to lazy fills
+      try {
+        for (let page = 0; page < maxPages; page++) {
+          const response = await this.client.get('/books', {
+            params: { count: pageSize, offset: page * pageSize }
+          });
+          const books: Book[] = response.data?.data ?? [];
+          for (const book of books) {
+            if (book?.id != null) entry.cache.set(book.id, book.slug || String(book.id));
+          }
+          if (books.length < pageSize) break;
+        }
+      } catch {
+        // Non-fatal: leave the cache partially warm; getBookSlug lazily fills gaps.
+      } finally {
+        // Stamp on completion (success or caught failure) so a broken BookStack
+        // can't trigger a warm-storm; clear the in-flight promise so the next
+        // lookup after the TTL can re-sweep.
+        entry.warmedAt = Date.now();
+        entry.warm = undefined;
+      }
+    })();
+    return entry.warm;
+  }
+
+  private async getBookSlug(bookId: number): Promise<string> {
+    // A single bulk warm turns the per-result N+1 into +1; after it, every book
+    // that existed at warm time is a cache hit — shared across all sessions.
+    await this.warmBookSlugCache();
+
+    const entry = this.slugCache;
+    const cached = entry.cache.get(bookId);
+    if (cached !== undefined) return cached;
+
+    // Gap (book created after warm, or beyond the warm cap): lazily fetch it, but
+    // share one in-flight request across concurrent callers so a batch of results
+    // referencing the same new book can't stampede.
+    const inflight = entry.inflight.get(bookId);
+    if (inflight) return inflight;
+
+    const request = (async () => {
+      try {
+        const response = await this.client.get(`/books/${bookId}`);
+        const slug = response.data.slug || String(bookId);
+        entry.cache.set(bookId, slug);
+        return slug;
+      } catch (error) {
+        // Fallback to ID if book fetch fails
+        return String(bookId);
+      } finally {
+        entry.inflight.delete(bookId);
+      }
+    })();
+    entry.inflight.set(bookId, request);
+    return request;
   }
 
   // URL generation utilities
@@ -155,35 +357,34 @@ export class BookStackClient {
     return `${this.baseUrl}/search?term=${encodedQuery}`;
   }
 
-  // Enhanced response helpers
+  // Enhanced response helpers. Each one adds only `url` on top of the raw
+  // BookStack record — narrated/duplicate fields (direct_link, *_friendly,
+  // content_info, summary, location, etc.) were removed to shrink the MCP
+  // payload; the LLM can derive them from the raw fields when needed.
   private enhanceBookResponse(book: Book): any {
-    const lastUpdated = this.formatDate(book.updated_at);
-    const created = this.formatDate(book.created_at);
-    
     return {
       ...book,
-      url: this.generateBookUrl(book),
-      direct_link: `[${book.name}](${this.generateBookUrl(book)})`,
-      last_updated_friendly: lastUpdated,
-      created_friendly: created,
-      summary: book.description ? `${book.description.substring(0, 100)}${book.description.length > 100 ? '...' : ''}` : 'No description available',
-      content_info: `Book created ${created}, last updated ${lastUpdated}`
+      url: this.generateBookUrl(book)
     };
   }
 
   private async enhancePageResponse(page: Page, options?: {
-    format?: 'markdown' | 'html' | 'text';
+    format?: PageContentFormat;
     offset?: number;
     limit?: number;
   }): Promise<any> {
-    const lastUpdated = this.formatDate(page.updated_at);
-    const created = this.formatDate(page.created_at);
     const url = await this.generatePageUrl(page);
 
-    // Pick a single content format to return to avoid 3x duplication (html + markdown + text)
+    // Pick a single content format to return to avoid 3x duplication (html + markdown + text).
+    // 'raw' is the stored editor HTML; unlike 'html' it has not been through BookStack's
+    // render step, so it is the safe base for HTML written back with update_page.
+    // Markdown-authored pages should be edited through 'markdown' instead.
     const format = options?.format ?? 'markdown';
     const fullContent: string =
-      (format === 'html' ? page.html : format === 'text' ? page.text : page.markdown) || '';
+      (format === 'html' ? page.html
+        : format === 'raw' ? page.raw_html
+        : format === 'text' ? page.text
+        : page.markdown) || '';
 
     // Character-range slicing so very large pages can be paginated
     const DEFAULT_LIMIT = 50000;
@@ -194,64 +395,36 @@ export class BookStackClient {
     const nextOffset = offset + slice.length;
     const truncated = nextOffset < totalChars;
 
-    // Strip duplicate large fields from the base page object
-    const { html: _h, markdown: _m, text: _t, ...pageMeta } = page;
+    // Strip duplicate large fields from the base page object. raw_html is the
+    // unprocessed editor source BookStack returns alongside html/markdown/text;
+    // leaving it in would bypass the limit/offset pagination and can blow past
+    // MCP token caps for large pages.
+    const { html: _h, markdown: _m, text: _t, raw_html: _r, ...pageMeta } = page as any;
 
     return {
       ...pageMeta,
       url,
-      direct_link: `[${page.name}](${url})`,
-      last_updated_friendly: lastUpdated,
-      created_friendly: created,
-      content_info: `Page created ${created}, last updated ${lastUpdated}`,
-      word_count: page.text ? page.text.split(' ').length : 0,
-      location: `Book ID ${page.book_id}${page.chapter_id ? `, Chapter ID ${page.chapter_id}` : ''}`,
+      word_count: countWords(page),
       content_format: format,
       content_total_chars: totalChars,
       content_offset: offset,
       content_returned_chars: slice.length,
       content_truncated: truncated,
       content_next_offset: truncated ? nextOffset : null,
-      pagination_hint: truncated
-        ? `Only ${nextOffset}/${totalChars} characters returned. Call get_page again with offset=${nextOffset} to continue, or pass a larger limit.`
-        : undefined,
       content: slice
     };
   }
 
   private async enhanceChapterResponse(chapter: Chapter): Promise<any> {
-    const lastUpdated = this.formatDate(chapter.updated_at);
-    const created = this.formatDate(chapter.created_at);
     const url = await this.generateChapterUrl(chapter);
-
-    return {
-      ...chapter,
-      url,
-      direct_link: `[${chapter.name}](${url})`,
-      last_updated_friendly: lastUpdated,
-      created_friendly: created,
-      summary: chapter.description ? `${chapter.description.substring(0, 100)}${chapter.description.length > 100 ? '...' : ''}` : 'No description available',
-      content_info: `Chapter created ${created}, last updated ${lastUpdated}`,
-      location: `In Book ID ${chapter.book_id}`
-    };
+    return { ...chapter, url };
   }
 
   private enhanceShelfResponse(shelf: Shelf): any {
-    const lastUpdated = this.formatDate(shelf.updated_at);
-    const created = this.formatDate(shelf.created_at);
-    const bookCount = shelf.books?.length || 0;
-    
     return {
       ...shelf,
       url: this.generateShelfUrl(shelf),
-      direct_link: `[${shelf.name}](${this.generateShelfUrl(shelf)})`,
-      last_updated_friendly: lastUpdated,
-      created_friendly: created,
-      summary: shelf.description ? `${shelf.description.substring(0, 100)}${shelf.description.length > 100 ? '...' : ''}` : 'No description available',
-      content_info: `Shelf with ${bookCount} book${bookCount !== 1 ? 's' : ''}, created ${created}, last updated ${lastUpdated}`,
-      book_count: bookCount,
-      books: shelf.books?.map(book => this.enhanceBookResponse(book)),
-      tags_summary: shelf.tags?.length ? `Tagged with: ${shelf.tags.map(t => `${t.name}${t.value ? `=${t.value}` : ''}`).join(', ')}` : 'No tags'
+      books: shelf.books?.map(book => this.enhanceBookResponse(book))
     };
   }
 
@@ -259,21 +432,19 @@ export class BookStackClient {
     const enhancedResults = await Promise.all(
       results.map(async (result) => {
         const url = await this.generateContentUrl(result);
-        return {
-          ...result,
-          url,
-          direct_link: `[${result.name}](${url})`,
-          content_preview: result.preview_content?.content ? `${result.preview_content.content.substring(0, 150)}${result.preview_content.content.length > 150 ? '...' : ''}` : 'No preview available',
-          content_type: result.type.charAt(0).toUpperCase() + result.type.slice(1),
-          location_info: result.book_id ? `In book ID ${result.book_id}${result.chapter_id ? `, chapter ID ${result.chapter_id}` : ''}` : 'Location unknown'
-        };
+        const preview = result.preview_content?.content;
+        const out: any = { ...result, url };
+        if (preview) {
+          out.content_preview = preview.length > 150 ? `${preview.substring(0, 150)}...` : preview;
+        }
+        return out;
       })
     );
 
     return {
       search_query: originalQuery,
       search_url: this.generateSearchUrl(originalQuery),
-      summary: `Found ${results.length} results for "${originalQuery}"`,
+      total: results.length,
       results: enhancedResults
     };
   }
@@ -307,6 +478,7 @@ export class BookStackClient {
     count?: number;
     offset?: number;
   }): Promise<any> {
+    validateUserIdFilters(query);
     let searchQuery = query;
 
     // Use advanced search syntax for type filtering
@@ -329,19 +501,28 @@ export class BookStackClient {
     count?: number;
     offset?: number;
   }): Promise<any> {
-    let searchQuery = `{type:page} ${query}`.trim();
+    validateUserIdFilters(query);
+    const searchQuery = `{type:page} ${query}`.trim();
+    const bookId = options?.bookId;
+    const wanted = options?.count ? Math.min(options.count, 500) : undefined;
 
-    // Add book filtering if specified
-    if (options?.bookId) {
-      searchQuery = `{book_id:${options.bookId}} ${searchQuery}`;
-    }
-
+    // BookStack search has NO book-scoping filter token — `{book_id:X}` is
+    // silently ignored (it returned the whole wiki), so scoping was a no-op that
+    // leaked other books' pages. Instead over-fetch and filter client-side on
+    // book_id. Best-effort: matches ranked beyond the 500-result ceiling can be
+    // missed, but every returned result genuinely belongs to the requested book.
     const params: any = { query: searchQuery };
-    if (options?.count) params.count = Math.min(options.count, 500);
+    params.count = bookId ? 500 : wanted;
+    if (params.count === undefined) delete params.count;
     if (options?.offset) params.offset = options.offset;
 
     const response = await this.client.get('/search', { params });
-    const results = response.data.data || response.data;
+    let results: SearchResult[] = response.data.data || response.data;
+
+    if (bookId) {
+      results = results.filter((r) => r.book_id === bookId);
+      if (wanted) results = results.slice(0, wanted);
+    }
 
     return await this.enhanceSearchResults(results, query);
   }
@@ -358,8 +539,8 @@ export class BookStackClient {
     };
     
     if (options?.sort) params.sort = options.sort;
-    if (options?.filter) params.filter = JSON.stringify(options.filter);
-    
+    this.applyFilters(params, options?.filter);
+
     const response = await this.client.get('/books', { params });
     const data = response.data;
     
@@ -387,14 +568,10 @@ export class BookStackClient {
       count: Math.min(options?.count || 50, 500)
     };
 
-    // Build filter object
-    const filter: any = { ...options?.filter };
+    const filter: Record<string, any> = { ...options?.filter };
     if (options?.bookId) filter.book_id = options.bookId;
     if (options?.chapterId) filter.chapter_id = options.chapterId;
-
-    if (Object.keys(filter).length > 0) {
-      params.filter = JSON.stringify(filter);
-    }
+    this.applyFilters(params, filter);
 
     if (options?.sort) params.sort = options.sort;
 
@@ -408,41 +585,49 @@ export class BookStackClient {
   }
 
   private async enhancePageListItem(page: Page): Promise<any> {
-    const lastUpdated = this.formatDate(page.updated_at);
-    const created = this.formatDate(page.created_at);
     const url = await this.generatePageUrl(page);
-    const preview = page.text
-      ? `${page.text.substring(0, 200)}${page.text.length > 200 ? '...' : ''}`
-      : 'No content preview available';
 
-    // List responses from BookStack don't include html/markdown/text, but strip defensively
-    // and never embed full content here — use get_page for that.
-    const { html: _h, markdown: _m, text: _t, ...pageMeta } = page as any;
+    // List responses from BookStack don't include html/markdown/text/raw_html, but strip
+    // defensively and never embed full content here — use get_page for that.
+    const { html: _h, markdown: _m, text: _t, raw_html: _r, ...pageMeta } = page as any;
 
-    return {
-      ...pageMeta,
-      url,
-      direct_link: `[${page.name}](${url})`,
-      last_updated_friendly: lastUpdated,
-      created_friendly: created,
-      content_preview: preview,
-      content_info: `Page created ${created}, last updated ${lastUpdated}`,
-      location: `Book ID ${page.book_id}${page.chapter_id ? `, Chapter ID ${page.chapter_id}` : ''}`
-    };
+    const out: any = { ...pageMeta, url };
+    if (page.text) {
+      out.content_preview = page.text.length > 200 ? `${page.text.substring(0, 200)}...` : page.text;
+    }
+    return out;
   }
 
   async getPage(id: number, options?: {
-    format?: 'markdown' | 'html' | 'text';
+    format?: PageContentFormat;
     offset?: number;
     limit?: number;
   }): Promise<any> {
     const response = await this.client.get(`/pages/${id}`);
-    return await this.enhancePageResponse(response.data, options);
+    const pageData = response.data;
+
+    // BookStack stores either markdown or html depending on the editor used to
+    // author the page. If markdown was requested but the page was authored in
+    // the WYSIWYG editor, page.markdown comes back empty. Fall back to the
+    // server-side HTML→markdown export so the caller still gets usable content.
+    const requestedFormat = options?.format ?? 'markdown';
+    if (requestedFormat === 'markdown' && !pageData.markdown) {
+      try {
+        const exportResponse = await this.client.get(`/pages/${id}/export/markdown`);
+        if (exportResponse.data) {
+          pageData.markdown = exportResponse.data;
+        }
+      } catch (error) {
+        logSafeError(`Markdown export fallback failed for page ${id}`, error);
+      }
+    }
+
+    return await this.enhancePageResponse(pageData, options);
   }
 
   async getChapters(bookId?: number, offset = 0, count = 50): Promise<any> {
     const params: any = { offset, count };
-    if (bookId) params.filter = JSON.stringify({ book_id: bookId });
+    if (bookId) params['filter[book_id]'] = bookId;
 
     const response = await this.client.get('/chapters', { params });
     const data = response.data;
@@ -458,27 +643,145 @@ export class BookStackClient {
     return await this.enhanceChapterResponse(response.data);
   }
 
+  async listImages(options: { uploaded_to?: number; offset?: number; count?: number; sort?: string } = {}): Promise<any> {
+    const params: any = { offset: options.offset ?? 0, count: Math.min(options.count ?? 50, 500) };
+    if (options.sort) params.sort = options.sort;
+    if (options.uploaded_to !== undefined) params['filter[uploaded_to]'] = options.uploaded_to;
+    return (await this.client.get('/image-gallery', { params })).data;
+  }
+
+  async createImage(data: { file_path?: string; url?: string; name?: string; uploaded_to: number }): Promise<any> {
+    if (!this.enableWrite) throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    if (!Number.isInteger(data.uploaded_to) || data.uploaded_to < 1) throw new PublicError('uploaded_to must be a positive page ID.');
+    const source = await readImageSource({ ...data,
+      allowLocalFiles: this.imageSourcePolicy.allowLocalImageFiles,
+      allowedHosts: this.imageSourcePolicy.imageAllowedHosts
+    });
+    const form = new FormData();
+    form.set('type', 'gallery');
+    form.set('uploaded_to', String(data.uploaded_to));
+    if (data.name !== undefined) form.set('name', data.name);
+    form.set('image', new Blob([new Uint8Array(source.bytes)], { type: source.type }), source.filename);
+    try {
+      // Removing the JSON default lets Axios set the multipart boundary. Using
+      // the existing client preserves token auth, TLS settings and retry limits.
+      return (await this.client.post('/image-gallery', form, {
+        headers: { 'Content-Type': undefined }, maxBodyLength: MAX_IMAGE_BYTES + 1024 * 1024
+      })).data;
+    } catch (error) {
+      throw safeError(error, 'BookStack image upload failed');
+    }
+  }
+
+  async deleteImage(id: number): Promise<any> {
+    if (!this.enableWrite) throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    await this.client.delete(`/image-gallery/${id}`);
+    return { deleted: true, id };
+  }
+
+  async createBook(data: {
+    name: string;
+    description?: string;
+    tags?: Tag[];
+  }): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.post('/books', data);
+    return this.enhanceBookResponse(response.data);
+  }
+
+  async createChapter(data: {
+    book_id: number;
+    name: string;
+    description?: string;
+    tags?: Tag[];
+  }): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.post('/chapters', data);
+    return await this.enhanceChapterResponse(response.data);
+  }
+
+  async updateBook(id: number, data: {
+    name?: string;
+    description?: string;
+    tags?: Tag[];
+  }): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.put(`/books/${id}`, data);
+    return this.enhanceBookResponse(response.data);
+  }
+
+  async updateChapter(id: number, data: {
+    name?: string;
+    description?: string;
+    book_id?: number;
+    priority?: number;
+    tags?: Tag[];
+  }): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.put(`/chapters/${id}`, data);
+    return await this.enhanceChapterResponse(response.data);
+  }
+
   async createPage(data: {
     name: string;
     html?: string;
     markdown?: string;
     book_id: number;
     chapter_id?: number;
+    changelog?: string;
+    tags?: Tag[];
   }): Promise<any> {
     if (!this.enableWrite) {
-      throw new Error('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
     }
     const response = await this.client.post('/pages', data);
     return await this.enhancePageResponse(response.data);
+  }
+
+  async deleteBook(id: number): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.delete(`/books/${id}`);
+    return response.data;
+  }
+
+  async deleteChapter(id: number): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.delete(`/chapters/${id}`);
+    return response.data;
+  }
+
+  async deletePage(id: number): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.delete(`/pages/${id}`);
+    return response.data;
   }
 
   async updatePage(id: number, data: {
     name?: string;
     html?: string;
     markdown?: string;
+    book_id?: number;
+    chapter_id?: number;
+    priority?: number;
+    changelog?: string;
+    tags?: Tag[];
   }): Promise<any> {
     if (!this.enableWrite) {
-      throw new Error('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
     }
     const response = await this.client.put(`/pages/${id}`, data);
     return await this.enhancePageResponse(response.data);
@@ -517,15 +820,15 @@ export class BookStackClient {
         
         // For text formats, validate and return as string
         if (!response.data) {
-          throw new Error(`Empty ${format} content returned from BookStack API`);
+          throw new PublicError(`Empty ${format} content returned from BookStack API`);
         }
         
         console.error(`Text export length: ${response.data.length} characters`);
         return response.data;
       }
     } catch (error) {
-      console.error(`Export error for page ${id}:`, error);
-      throw new Error(`Failed to export page ${id} as ${format}: ${error instanceof Error ? error.message : String(error)}`);
+      logSafeError(`Export error for page ${id}`, error);
+      throw safeError(error, `Failed to export page ${id} as ${format}`);
     }
   }
 
@@ -603,93 +906,52 @@ export class BookStackClient {
     dateThreshold.setDate(dateThreshold.getDate() - days);
     const dateFilter = dateThreshold.toISOString().split('T')[0]; // YYYY-MM-DD format
     
-    // Build search query for recent changes
-    let searchQuery = `{updated_at:>=${dateFilter}}`;
+    // Build search query for recent changes. BookStack's search syntax uses
+    // `{updated_after:YYYY-MM-DD}` — NOT `{updated_at:>=...}` (that token does
+    // not exist, and BookStack silently ignores unknown `{...}` filters and
+    // returns the entire wiki). `/search` also does not honor a `sort` query
+    // param (sorting is `{sort_by:...}` in the query), so we sort client-side.
+    let searchQuery = `{updated_after:${dateFilter}}`;
     if (type !== 'all') {
       searchQuery = `{type:${type}} ${searchQuery}`;
     }
-    
+
     const params = {
       query: searchQuery,
-      count: limit,
-      sort: 'updated_at' // Sort by most recently updated
+      count: limit
     };
-    
+
     const response = await this.client.get('/search', { params });
     const results = response.data.data || response.data;
-    
-    // Enhance results with additional context
+
+    // Use the search response data as-is — callers fetch full details via
+    // get_page/get_book/get_chapter if needed. URL enhancement resolves a book
+    // slug per item, but getBookSlug bulk-warms its cache once, so this is +1
+    // request, not the per-item N+1 it would otherwise be.
     const enhancedResults = await Promise.all(
       results.map(async (result: SearchResult) => {
-        let contextualInfo = '';
-        let contentPreview = result.preview_content?.content || '';
-        
-        try {
-          // Get additional context based on content type
-          if (result.type === 'page' && result.id) {
-            const fullPage = await this.client.get(`/pages/${result.id}`);
-            const pageData = fullPage.data;
-            contentPreview = pageData.text?.substring(0, 200) || contentPreview;
-            contextualInfo = `Updated in book: ${pageData.book?.name || 'Unknown Book'}`;
-            if (pageData.chapter) {
-              contextualInfo += `, chapter: ${pageData.chapter.name}`;
-            }
-          } else if (result.type === 'book' && result.id) {
-            const fullBook = await this.client.get(`/books/${result.id}`);
-            const bookData = fullBook.data;
-            contentPreview = bookData.description?.substring(0, 200) || 'No description available';
-            contextualInfo = `Book with ${bookData.page_count || 0} pages`;
-          } else if (result.type === 'chapter' && result.id) {
-            const fullChapter = await this.client.get(`/chapters/${result.id}`);
-            const chapterData = fullChapter.data;
-            contentPreview = chapterData.description?.substring(0, 200) || 'No description available';
-            contextualInfo = `Chapter in book: ${chapterData.book?.name || 'Unknown Book'}`;
-          }
-        } catch (error) {
-          // If we can't get additional context, use what we have
-          contextualInfo = `${result.type.charAt(0).toUpperCase() + result.type.slice(1)} content`;
-        }
-
         const url = await this.generateContentUrl(result);
-        return {
-          ...result,
-          url,
-          direct_link: `[${result.name}](${url})`,
-          content_preview: contentPreview ? `${contentPreview}${contentPreview.length >= 200 ? '...' : ''}` : 'No preview available',
-          contextual_info: contextualInfo,
-          last_updated: this.formatDate(result.updated_at || result.created_at || ''),
-          change_summary: `${result.type === 'page' ? 'Page' : result.type === 'book' ? 'Book' : 'Chapter'} "${result.name}" was updated`
-        };
+        const preview = result.preview_content?.content;
+        const out: any = { ...result, url };
+        if (preview) {
+          out.content_preview = preview.length > 200 ? `${preview.substring(0, 200)}...` : preview;
+        }
+        return out;
       })
     );
-    
+
+    // `/search` orders by relevance, not recency, so sort newest-first here.
+    enhancedResults.sort((a, b) =>
+      String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')));
+
     return {
-      search_query: `Recent changes in the last ${days} days (${type})`,
       date_threshold: dateFilter,
-      search_url: this.generateSearchUrl(searchQuery),
-      total_found: results.length,
-      summary: `Found ${results.length} items updated in the last ${days} days${type !== 'all' ? ` (${type}s only)` : ''}`,
+      type,
+      // The true match count for the window (results is only the current page).
+      total: response.data.total ?? results.length,
+      returned: enhancedResults.length,
       results: enhancedResults
     };
-  }
-
-  private formatDate(dateString: string): string {
-    if (!dateString) return 'Unknown date';
-    
-    const date = new Date(dateString);
-    const now = new Date();
-    const diffInHours = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60));
-    
-    if (diffInHours < 1) return 'Less than an hour ago';
-    if (diffInHours < 24) return `${diffInHours} hours ago`;
-    
-    const diffInDays = Math.floor(diffInHours / 24);
-    if (diffInDays < 7) return `${diffInDays} days ago`;
-    
-    const diffInWeeks = Math.floor(diffInDays / 7);
-    if (diffInWeeks < 4) return `${diffInWeeks} weeks ago`;
-    
-    return date.toLocaleDateString();
   }
 
   // Shelves (Book Collections) Management
@@ -705,8 +967,8 @@ export class BookStackClient {
     };
     
     if (options?.sort) params.sort = options.sort;
-    if (options?.filter) params.filter = JSON.stringify(options.filter);
-    
+    this.applyFilters(params, options?.filter);
+
     const response = await this.client.get('/shelves', { params });
     const data = response.data;
     
@@ -728,7 +990,7 @@ export class BookStackClient {
     tags?: Tag[];
   }): Promise<any> {
     if (!this.enableWrite) {
-      throw new Error('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
     }
     const response = await this.client.post('/shelves', data);
     return this.enhanceShelfResponse(response.data);
@@ -741,7 +1003,7 @@ export class BookStackClient {
     tags?: Tag[];
   }): Promise<any> {
     if (!this.enableWrite) {
-      throw new Error('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
     }
     const response = await this.client.put(`/shelves/${id}`, data);
     return this.enhanceShelfResponse(response.data);
@@ -749,7 +1011,7 @@ export class BookStackClient {
 
   async deleteShelf(id: number): Promise<any> {
     if (!this.enableWrite) {
-      throw new Error('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
     }
     const response = await this.client.delete(`/shelves/${id}`);
     return response.data;
@@ -768,8 +1030,8 @@ export class BookStackClient {
     };
     
     if (options?.sort) params.sort = options.sort;
-    if (options?.filter) params.filter = JSON.stringify(options.filter);
-    
+    this.applyFilters(params, options?.filter);
+
     const response = await this.client.get('/attachments', { params });
     const data = response.data;
     
@@ -777,8 +1039,7 @@ export class BookStackClient {
       ...data,
       data: data.data.map((attachment: Attachment) => ({
         ...attachment,
-        page_url: `${this.baseUrl}/books/${Math.floor(attachment.uploaded_to / 1000)}/page/${attachment.uploaded_to}`,
-        direct_link: `[${attachment.name}](${this.baseUrl}/attachments/${attachment.id})`
+        download_url: `${this.baseUrl}/attachments/${attachment.id}`
       }))
     };
   }
@@ -786,11 +1047,8 @@ export class BookStackClient {
   async getAttachment(id: number): Promise<any> {
     const response = await this.client.get(`/attachments/${id}`);
     const attachment = response.data;
-    
     return {
       ...attachment,
-      page_url: `${this.baseUrl}/books/${Math.floor(attachment.uploaded_to / 1000)}/page/${attachment.uploaded_to}`,
-      direct_link: `[${attachment.name}](${this.baseUrl}/attachments/${attachment.id})`,
       download_url: `${this.baseUrl}/attachments/${attachment.id}`
     };
   }
@@ -802,15 +1060,13 @@ export class BookStackClient {
     // Note: File uploads would require multipart/form-data which is complex via this interface
   }): Promise<any> {
     if (!this.enableWrite) {
-      throw new Error('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
     }
     const response = await this.client.post('/attachments', data);
     const attachment = response.data;
-    
     return {
       ...attachment,
-      page_url: `${this.baseUrl}/books/${Math.floor(attachment.uploaded_to / 1000)}/page/${attachment.uploaded_to}`,
-      direct_link: `[${attachment.name}](${this.baseUrl}/attachments/${attachment.id})`
+      download_url: `${this.baseUrl}/attachments/${attachment.id}`
     };
   }
 
@@ -820,23 +1076,126 @@ export class BookStackClient {
     uploaded_to?: number;
   }): Promise<any> {
     if (!this.enableWrite) {
-      throw new Error('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
     }
     const response = await this.client.put(`/attachments/${id}`, data);
     const attachment = response.data;
-    
     return {
       ...attachment,
-      page_url: `${this.baseUrl}/books/${Math.floor(attachment.uploaded_to / 1000)}/page/${attachment.uploaded_to}`,
-      direct_link: `[${attachment.name}](${this.baseUrl}/attachments/${attachment.id})`
+      download_url: `${this.baseUrl}/attachments/${attachment.id}`
     };
   }
 
   async deleteAttachment(id: number): Promise<any> {
     if (!this.enableWrite) {
-      throw new Error('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
     }
     const response = await this.client.delete(`/attachments/${id}`);
+    return response.data;
+  }
+
+  // Comments (BookStack v25.11+)
+  async getComments(options?: {
+    pageId?: number;
+    offset?: number;
+    count?: number;
+    sort?: string;
+  }): Promise<any> {
+    const params: any = {
+      offset: options?.offset || 0,
+      count: Math.min(options?.count || 50, 500)
+    };
+    if (options?.pageId) params['filter[commentable_id]'] = options.pageId;
+    if (options?.sort) params.sort = options.sort;
+
+    const response = await this.client.get('/comments', { params });
+    return response.data;
+  }
+
+  async getComment(id: number): Promise<any> {
+    const response = await this.client.get(`/comments/${id}`);
+    return response.data;
+  }
+
+  async createComment(data: {
+    page_id: number;
+    html: string;
+    parent_id?: number;
+    content_ref?: string;
+  }): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.post('/comments', data);
+    return response.data;
+  }
+
+  async updateComment(id: number, data: {
+    html?: string;
+    archived?: boolean;
+  }): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.put(`/comments/${id}`, data);
+    return response.data;
+  }
+
+  async deleteComment(id: number): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.delete(`/comments/${id}`);
+    return response.data;
+  }
+
+  // Recycle Bin
+  async getRecycleBin(options?: {
+    offset?: number;
+    count?: number;
+    sort?: string;
+  }): Promise<any> {
+    const params: any = {
+      offset: options?.offset || 0,
+      count: Math.min(options?.count || 50, 500)
+    };
+    if (options?.sort) params.sort = options.sort;
+
+    const response = await this.client.get('/recycle-bin', { params });
+    return response.data;
+  }
+
+  async restoreFromRecycleBin(deletionId: number): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.put(`/recycle-bin/${deletionId}`);
+    return response.data;
+  }
+
+  async destroyFromRecycleBin(deletionId: number): Promise<any> {
+    if (!this.enableWrite) {
+      throw new PublicError('Write operations are disabled. Set BOOKSTACK_ENABLE_WRITE=true to enable.');
+    }
+    const response = await this.client.delete(`/recycle-bin/${deletionId}`);
+    return response.data;
+  }
+
+  // Users
+  async getUsers(options?: {
+    offset?: number;
+    count?: number;
+    sort?: string;
+    filter?: Record<string, any>;
+  }): Promise<ListResponse<User>> {
+    const params: any = {
+      offset: options?.offset || 0,
+      count: Math.min(options?.count || 50, 500)
+    };
+    if (options?.sort) params.sort = options.sort;
+    this.applyFilters(params, options?.filter);
+
+    const response = await this.client.get('/users', { params });
     return response.data;
   }
 }

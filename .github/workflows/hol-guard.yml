@@ -1,0 +1,103 @@
+name: HOL Guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate marketplace metadata
+        run: node scripts/check-plugin.mjs
+
+      - name: Validate registry reporting
+        run: python3 -m unittest discover -s scripts -p 'test_report_hol.py'
+
+      - name: Scan plugin locally
+        id: scan
+        uses: hashgraph-online/ai-plugin-scanner-action@9b169fc65d09b24726b66d70b3563ab563158b58 # v1.2.816
+        with:
+          plugin_dir: '.'
+          mode: scan
+          format: markdown
+          output: '${{ runner.temp }}/hol-guard-report.md'
+          # Scan all detected manifests, including the native Codex interface.
+          # Missing marketplace policy links must block the PR.
+          fail_on_severity: medium
+          min_score: 95
+          online: false
+          install_cisco: false
+          cisco_skill_scan: 'off'
+          upload_sarif: false
+          submission_enabled: false
+          pr_comment: 'off'
+
+      - name: Preserve scanner report
+        if: always() && steps.scan.outputs.report_path != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hol-scan-report
+          path: '${{ runner.temp }}/hol-guard-report.md'
+          retention-days: 14
+          if-no-files-found: warn
+
+  report:
+    name: Report trusted scan to HOL
+    # Registry availability must not change the independent scanner verdict.
+    # Delivery still requires a receipt and failures remain visible in this job.
+    continue-on-error: true
+    needs: scan
+    # PRs run the read-only scan above; only main can attest a registry result.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Scan summary for HOL
+        id: summary
+        uses: hashgraph-online/ai-plugin-scanner-action@9b169fc65d09b24726b66d70b3563ab563158b58 # v1.2.816
+        with:
+          plugin_dir: '.'
+          mode: scan
+          format: json
+          output: '${{ runner.temp }}/hol-registry-report.json'
+          min_score: 95
+          fail_on_severity: medium
+          online: false
+          install_cisco: false
+          cisco_skill_scan: 'off'
+          upload_sarif: false
+          submission_enabled: false
+          pr_comment: 'off'
+      # The released scanner ignores report_to_hol; use the same OIDC contract
+      # explicitly and require a receipt until its packaged implementation ships.
+      - name: Report summary to HOL and verify receipt
+        env:
+          HOL_SCAN_REPORT: '${{ runner.temp }}/hol-registry-report.json'
+        run: python3 scripts/report-hol.py "$HOL_SCAN_REPORT"
+
+      - name: Preserve registry scan summary
+        if: always() && steps.summary.outputs.report_path != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hol-registry-scan-summary
+          path: '${{ runner.temp }}/hol-registry-report.json'
+          retention-days: 14
+          if-no-files-found: warn
